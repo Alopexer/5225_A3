@@ -1,152 +1,246 @@
 import json
 import boto3
-import base64
-import os
-import uuid
-import cv2 as cv
-from boto3.dynamodb.conditions import Attr
-from birds_detection import get_species_list  #  birds_detection.py 添加此函数
+from boto3.dynamodb.conditions import Attr, And
+from functools import reduce
+import decimal
+# from birds_detection import predict_tags
+# import base64
 
-dynamodb = boto3.resource('dynamodb')
-table = dynamodb.Table('BirdMediaMetadata')  # 替换成真实的表名
+class DecimalEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, decimal.Decimal):
+            return int(obj) if obj % 1 == 0 else float(obj)
+        return super(DecimalEncoder, self).default(obj)
+
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table("ImageTagsTable")  # 修改为真实表名
+s3 = boto3.client("s3")
 
 def lambda_handler(event, context):
     try:
-        body = json.loads(event.get("body", "{}"))
-        query_type = body.get("queryType")
+        if event.get("httpMethod") != "POST":
+            return error(405, "Only POST allowed")
 
-        if query_type == "byTagsWithCount":
-            return query_by_tags_with_count(body)
-        elif query_type == "byTagsOnly":
-            return query_by_tags_only(body)
-        elif query_type == "byThumbUrl":
-            return query_by_thumbnail_url(body)
-        elif query_type == "manualTagEdit":
-            return update_tags(body)
-        elif query_type == "predictAndSearch":
-            return predict_and_search(body)
+        raw_body = event.get("body", "{}")
+
+        if isinstance(raw_body, str):
+            data = json.loads(raw_body)
         else:
-            return {
-                "statusCode": 400,
-                "body": json.dumps({"error": "Invalid queryType."})
-            }
+            data = raw_body
+
+        action = data.get("action")
+
+        if action == "search":
+            return query_by_tags_with_count(data)
+        elif action == "fuzzy":
+            return query_by_tags_fuzzy(data)
+        elif action == "thumbnail":
+            return query_by_thumbnail(data)
+        elif action == "upload_query":
+            return query_by_uploaded_image(data)
+        elif action == "tag_edit":
+            return modify_tags(data)
+        elif action == "delete":
+            return delete_records(data)
+        elif action == "insert":
+            return insert_item(data)
+        else:
+            return error(400, "Invalid or missing action")
 
     except Exception as e:
-        return {
-            "statusCode": 500,
-            "body": json.dumps({"error": str(e)})
-        }
+        return error(500, str(e))
 
-# 查询类型 1: 标签 + 数量过滤
-def query_by_tags_with_count(body):
-    request_tags = body.get("tags", {})
-    if not request_tags:
-        return {"statusCode": 400, "body": json.dumps({"error": "Missing tags"})}
+# ---------------- Query Handlers ---------------- #
+
+def query_by_tags_with_count(data):
+    cond = data.get("tags", {})
+    if not cond:
+        return error(400, "Missing tags")
 
     response = table.scan()
-    results = []
+    matched = []
 
-    for item in response["Items"]:
-        file_tags = item.get("tags", {})
-        if all(file_tags.get(tag, 0) >= count for tag, count in request_tags.items()):
-            results.append(item.get("thumbnail_url") or item.get("s3_url"))
+    for item in response.get("Items", []):
+        item_tags = item.get("tags", {})
+        all_matched = True
 
-    return {"statusCode": 200, "body": json.dumps({"results": results})}
+        for k, v in cond.items():
+            required = int(v["N"])
+            actual = int(item_tags.get(k, 0))  
+            if actual < required:
+                all_matched = False
+                break
 
-# 查询类型 2: 任意标签（不带数量）
-def query_by_tags_only(body):
-    tag_list = body.get("tags", [])
-    if not tag_list:
-        return {"statusCode": 400, "body": json.dumps({"error": "Missing tag list"})}
+        if all_matched:
+            matched.append(item.get("s3_url"))
 
+    return success({"Links": matched})
+
+def query_by_tags_fuzzy(data):
+    tags = data.get("tags", [])
+    if not tags:
+        return error(400, "Missing tags")
+
+    matched = []
     response = table.scan()
-    results = []
+    for item in response.get("Items", []):
+        item_tags = item.get("tags", {})
+        if any(tag in item_tags for tag in tags):
+            url = item.get("s3_url")
+            if url:  # 只添加非空链接
+                matched.append(url)
 
-    for item in response["Items"]:
-        file_tags = item.get("tags", {})
-        if any(tag in file_tags for tag in tag_list):
-            results.append(item.get("thumbnail_url") or item.get("s3_url"))
+    return success({"Links": matched})
 
-    return {"statusCode": 200, "body": json.dumps({"results": results})}
 
-# 查询类型 3: 通过 thumbnail_url 返回 s3_url
-def query_by_thumbnail_url(body):
-    thumb_url = body.get("thumbnail_url")
-    if not thumb_url:
-        return {"statusCode": 400, "body": json.dumps({"error": "Missing thumbnail_url"})}
+def query_by_thumbnail(data):
+    thumb = data.get("thumbnail")
+    if not thumb:
+        return error(400, "Missing thumbnail")
 
-    response = table.scan(FilterExpression=Attr("thumbnail_url").eq(thumb_url))
+    response = table.scan(FilterExpression=Attr("thumbnail_url").eq(thumb))
     items = response.get("Items", [])
+    return success(items[0] if items else {})
 
-    if not items:
-        return {"statusCode": 404, "body": json.dumps({"error": "Thumbnail not found"})}
 
-    return {"statusCode": 200, "body": json.dumps({"s3_url": items[0].get("s3_url")})}
+# def query_by_uploaded_image(data):
+#     image_base64 = data.get("image")
+#     if not image_base64:
+#         return error(400, "Missing base64-encoded image")
 
-# 查询类型 4: 上传图像临时识别 → 查找包含相同标签的文件
-def predict_and_search(body):
-    image_data = body.get("image_base64")
-    if not image_data:
-        return {"statusCode": 400, "body": json.dumps({"error": "Missing base64 image"})}
+#     try:
+#         image_bytes = base64.b64decode(image_base64)
+#     except Exception:
+#         return error(400, "Base64 decode failed")
 
-    temp_image_path = f"/tmp/query_{uuid.uuid4().hex}.jpg"
-    with open(temp_image_path, "wb") as f:
-        f.write(base64.b64decode(image_data))
+#     try:
+#         tags = predict_tags(image_bytes)  
+#         if not tags:
+#             return error(500, "No tags predicted")
+#     except Exception as e:
+#         return error(500, f"Inference error: {str(e)}")
 
-    species = get_species_list(temp_image_path)
-    if not species:
-        return {"statusCode": 200, "body": json.dumps({"results": []})}
+#     # ✅ 在 DynamoDB 中模糊查询
+#     response = table.scan()
+#     matched = []
+#     for item in response.get("Items", []):
+#         item_tags = item.get("tags", {})
+#         if any(tag in item_tags for tag in tags):
+#             matched.append(item.get("s3-url"))
 
-    response = table.scan()
-    results = []
+#     return success({
+#         "inferred_tags": tags,
+#         "Links": matched
+#     })
 
-    for item in response["Items"]:
-        file_tags = item.get("tags", {})
-        if all(sp in file_tags for sp in species):
-            results.append(item.get("thumbnail_url") or item.get("s3_url"))
+def modify_tags(data):
+    urls = data.get("urls", [])
+    tags = data.get("tags", [])  # e.g., ["Crow,1", "Pigeon,2"]
+    operation = data.get("operation")  # 1 for add, 0 for delete
 
-    return {"statusCode": 200, "body": json.dumps({"results": results, "detected_species": species})}
-
-# 查询类型 5: 批量增删标签
-def update_tags(body):
-    urls = body.get("url", [])
-    tags = body.get("tags", [])  # 格式: ["crow,1", "pigeon,2"]
-    operation = int(body.get("operation", 1))
-
-    parsed_tags = {}
-    for tag in tags:
-        try:
-            name, count = tag.strip().split(",")
-            parsed_tags[name.strip()] = int(count)
-        except:
+    for url in urls:
+        # 查找该 thumbnail_url 对应的记录（反向获取 filename）
+        response = table.scan(FilterExpression=Attr("thumbnail_url").eq(url))
+        items = response.get("Items", [])
+        if not items:
             continue
 
-    updated = []
+        item = items[0]
+        filename = item["filename"]  # filename作为主键
+        original = item.get("tags", {})
+
+        # 更新标签
+        for tag_entry in tags:
+            name, val = tag_entry.split(",")
+            if operation == 1:
+                original[name] = int(val)
+            elif operation == 0 and name in original:
+                del original[name]
+
+        # 执行更新操作
+        table.update_item(
+            Key={"filename": filename},
+            UpdateExpression="SET tags = :t",
+            ExpressionAttributeValues={":t": original}
+        )
+
+    return success({"message": "Tags updated"})
+
+def delete_records(data):
+    urls = data.get("urls", [])
+    deleted = []
 
     for url in urls:
         response = table.scan(FilterExpression=Attr("thumbnail_url").eq(url))
         items = response.get("Items", [])
         if not items:
             continue
+
         item = items[0]
-        file_id = item["file_id"]
-        file_tags = item.get("tags", {})
+        filename = item["filename"]         
+        thumb_url = item.get("thumbnail_url")
+        s3_url = item.get("s3-url")
 
-        if operation == 1:
-            # 添加标签
-            for k, v in parsed_tags.items():
-                file_tags[k] = file_tags.get(k, 0) + v
-        else:
-            # 删除标签
-            for k in parsed_tags:
-                if k in file_tags:
-                    file_tags.pop(k)
+        # 删除 S3 文件
+        for s3_path in [thumb_url, s3_url]:
+            if s3_path:
+                bucket, key = parse_s3_url(s3_path)
+                try:
+                    s3.delete_object(Bucket=bucket, Key=key)
+                except:
+                    continue
 
-        table.update_item(
-            Key={"file_id": file_id},
-            UpdateExpression="SET tags = :t",
-            ExpressionAttributeValues={":t": file_tags}
-        )
-        updated.append(url)
+        # 删除数据库记录（按主键 filename）
+        table.delete_item(Key={"filename": filename})
+        deleted.append(filename)
 
-    return {"statusCode": 200, "body": json.dumps({"updated": updated})}
+    return success({"deleted": deleted})
+
+def insert_item(data):
+    required_fields = ["filename", "file_type", "s3_url", "tags", "thumbnail_url", "timestamp", "uploader"]
+    if not all(k in data for k in required_fields):
+        return error(400, "Missing required fields")
+
+    # 构造 DynamoDB item（确保数值类型用 Decimal）
+    item = {
+        "filename": data["filename"],
+        "file_type": data["file_type"],
+        "s3_url": data["s3_url"],
+        "tags": {k: decimal.Decimal(str(v)) for k, v in data["tags"].items()},
+        "thumbnail_url": data["thumbnail_url"],
+        "timestamp": data["timestamp"],
+        "uploader": data["uploader"]
+    }
+
+    table.put_item(Item=item)
+    return success({"message": "Item inserted", "filename": data["filename"]})
+
+# ---------------- Utils ---------------- #
+
+def parse_s3_url(s3_url):
+    # e.g., https://bucket-name.s3.amazonaws.com/path/to/file.jpg
+    parts = s3_url.split("/")
+    bucket = parts[2].split(".")[0]
+    key = "/".join(parts[3:])
+    return bucket, key
+
+def success(body):
+    return {
+        "statusCode": 200,
+        "body": json.dumps(body, cls=DecimalEncoder),
+        "headers": cors_headers()
+    }
+
+def error(code, message):
+    return {
+        "statusCode": code,
+        "body": json.dumps({"error": message}, cls=DecimalEncoder),
+        "headers": cors_headers()
+    }
+
+def cors_headers():
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "*",
+        "Access-Control-Allow-Headers": "*"
+    }
