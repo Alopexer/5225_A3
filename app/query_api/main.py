@@ -120,7 +120,7 @@ def query_by_thumbnail(data):
 #     except Exception as e:
 #         return error(500, f"Inference error: {str(e)}")
 
-#     # ✅ 在 DynamoDB 中模糊查询
+#  
 #     response = table.scan()
 #     matched = []
 #     for item in response.get("Items", []):
@@ -134,30 +134,33 @@ def query_by_thumbnail(data):
 #     })
 
 def modify_tags(data):
-    urls = data.get("urls", [])
+    urls = data.get("url", []) 
     tags = data.get("tags", [])  # e.g., ["Crow,1", "Pigeon,2"]
     operation = data.get("operation")  # 1 for add, 0 for delete
 
     for url in urls:
-        # 查找该 thumbnail_url 对应的记录（反向获取 filename）
+        # 查找 thumbnail_url 对应记录
         response = table.scan(FilterExpression=Attr("thumbnail_url").eq(url))
         items = response.get("Items", [])
         if not items:
             continue
 
         item = items[0]
-        filename = item["filename"]  # filename作为主键
+        filename = item["filename"]
         original = item.get("tags", {})
 
-        # 更新标签
+        # 遍历所有标签项
         for tag_entry in tags:
-            name, val = tag_entry.split(",")
-            if operation == 1:
-                original[name] = int(val)
-            elif operation == 0 and name in original:
-                del original[name]
+            try:
+                name, val = tag_entry.split(",")
+                if operation == 1:
+                    original[name] = decimal.Decimal(val)
+                elif operation == 0 and name in original:
+                    del original[name]
+            except Exception:
+                continue  # 跳过无效格式
 
-        # 执行更新操作
+        # 更新 DynamoDB
         table.update_item(
             Key={"filename": filename},
             UpdateExpression="SET tags = :t",
