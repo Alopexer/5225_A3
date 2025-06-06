@@ -100,7 +100,11 @@ def query_by_thumbnail(data):
 
     response = table.scan(FilterExpression=Attr("thumbnail_url").eq(thumb))
     items = response.get("Items", [])
-    return success(items[0] if items else {})
+
+    if not items:
+        return success({"s3_url": None})
+
+    return success({"s3_url": items[0].get("s3_url")})
 
 
 # def query_by_uploaded_image(data):
